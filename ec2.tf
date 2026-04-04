@@ -3,23 +3,22 @@ resource "aws_security_group" "AUY1105-tiendatech-sg" {
   description = "Permitir SSH restringido (no publico)"
   vpc_id      = aws_vpc.AUY1105-tiendatech-vpc.id
 
-
   ingress {
     description = "SSH restringido (politica OPA: no 0.0.0.0/0)"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = ["10.1.0.0/16"]   # Solo trafico interno VPC
+    cidr_blocks = ["10.1.0.0/16"]
   }
 
-
   egress {
+    description = "Permitir todo el trafico de salida a internet" # <-- ARREGLO CHECKOV
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
-tags = { Name = "AUY1105-tiendatech-sg" }
+  tags = { Name = "AUY1105-tiendatech-sg" }
 }
 
 
@@ -40,11 +39,16 @@ resource "aws_instance" "AUY1105-tiendatech-ec2" {
   subnet_id              = aws_subnet.AUY1105-tiendatech-subnet-pub-1.id
   vpc_security_group_ids = [aws_security_group.AUY1105-tiendatech-sg.id]
 
-
   root_block_device {
-    encrypted = true   # Requerido por Checkov
+    encrypted = true
   }
 
+  # <-- ARREGLO CHECKOV INICIO -->
+  metadata_options {
+    http_endpoint = "enabled"
+    http_tokens   = "required" # Fuerza el uso de IMDSv2
+  }
+  # <-- ARREGLO CHECKOV FIN -->
 
   tags = { Name = "AUY1105-tiendatech-ec2" }
 }
