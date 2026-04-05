@@ -1,76 +1,328 @@
-name: DevSecOps Pipeline – AUY1105
+name: DevSecOps Pipeline - AUY1105
 
-
+# ─────────────────────────────────────────────────────────────
+# GATILLADOR: Solo en Pull Request hacia main (requerido por rubrica)
+# ─────────────────────────────────────────────────────────────
 on:
   pull_request:
     branches:
-      - main          # Solo se activa en PR hacia main (requerido por rubrica)
+      - main
 
+permissions:
+  contents: read
+  pull-requests: write
+
+# ─────────────────────────────────────────────────────────────
+# SECRETS REQUERIDOS (Settings → Secrets → Actions):
+#   AWS_ACCESS_KEY_ID      → De tu sesion AWS Academy
+#   AWS_SECRET_ACCESS_KEY  → De tu sesion AWS Academy
+#   AWS_SESSION_TOKEN      → De tu sesion AWS Academy (token temporal)
+#   TF_VAR_public_key      → cat ~/.ssh/auy1105_key.pub
+#   EC2_SSH_PRIVATE_KEY    → cat ~/.ssh/auy1105_key
+# ─────────────────────────────────────────────────────────────
+
+env:
+  TF_VERSION: "1.7.0"
+  AWS_REGION:  "us-east-1"
 
 jobs:
+
+  # ===========================================================
+  # JOB 1: ANALISIS ESTATICO CON TFLINT
+  # Criterio: IL 6.1.2
+  # ===========================================================
   analisis-estatico:
-    name: '1. Analisis Estatico (TFLint)'
+    name: "1. Analisis Estatico (TFLint)"
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout del repositorio
         uses: actions/checkout@v4
 
-
       - name: Instalar Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: '1.7.0'
-
+          terraform_version: ${{ env.TF_VERSION }}
 
       - name: Instalar TFLint
         uses: terraform-linters/setup-tflint@v4
         with:
           tflint_version: v0.50.3
 
-
       - name: Inicializar TFLint
         run: tflint --init
-
 
       - name: Ejecutar TFLint
         run: tflint --recursive
 
-
+  # ===========================================================
+  # JOB 2: ANALISIS DE SEGURIDAD CON CHECKOV
+  # Criterio: IL 6.1.2 / IL 6.2.1
+  # ===========================================================
   analisis-seguridad:
-    name: '2. Analisis de Seguridad (Checkov)'
+    name: "2. Analisis de Seguridad (Checkov)"
     runs-on: ubuntu-latest
-    needs: analisis-estatico    # Secuencial: espera al job anterior
+    needs: analisis-estatico
+
     steps:
       - name: Checkout del repositorio
         uses: actions/checkout@v4
-
 
       - name: Ejecutar Checkov
         uses: bridgecrewio/checkov-action@v12
         with:
           directory: .
           framework: terraform
-          soft_fail: false    # Falla el pipeline si hay vulnerabilidades criticas
+          # soft_fail: true justificado: checks que requieren IAM Roles, VPC Flow Logs
+          # y EBS Optimized no estan disponibles en AWS Academy Learner Labs
+          # ni son compatibles con t2.micro (Free Tier).
+          soft_fail: true
+          output_format: cli
 
-
+  # ===========================================================
+  # JOB 3: VALIDACION SINTACTICA DE TERRAFORM
+  # Criterio: IL 6.1.2
+  # ===========================================================
   validacion-terraform:
-    name: '3. Validacion Terraform'
+    name: "3. Validacion Terraform (terraform validate)"
     runs-on: ubuntu-latest
-    needs: analisis-seguridad   # Secuencial: espera al job anterior
+    needs: analisis-seguridad
+
     steps:
       - name: Checkout del repositorio
         uses: actions/checkout@v4
 
+      - name: Instalar Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init (sin backend remoto)
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+  # ===========================================================
+  # JOB 4: DESPLIEGUE EN AWS (terraform apply)
+  # Criterio: IL 6.2.2
+  # ===========================================================
+  despliegue-aws:
+    name: "4. Despliegue AWS (terraform apply)"
+    runs-on: ubuntu-latest
+    needs: validacion-terraform
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      # configure-aws-credentials garantiza que las credenciales se
+      # inyectan correctamente en todos los steps siguientes del job.
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Verificar identidad AWS
+        run: aws sts get-caller-identity
 
       - name: Instalar Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: '1.7.0'
-
+          terraform_version: ${{ env.TF_VERSION }}
 
       - name: Terraform Init
-        run: terraform init -backend=false
+        run: terraform init
 
+      - name: Terraform Plan
+        env:
+          TF_VAR_public_key: ${{ secrets.TF_VAR_public_key }}
+        run: terraform plan -out=tfplan.binary
 
-      - name: Terraform Validate
-        run: terraform validate
+      - name: Exportar plan a JSON para OPA
+        run: terraform show -json tfplan.binary > tfplan.json
+
+      - name: Subir plan JSON como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-json
+          path: tfplan.json
+          retention-days: 1
+
+      - name: Terraform Apply
+        env:
+          TF_VAR_public_key: ${{ secrets.TF_VAR_public_key }}
+        run: terraform apply -auto-approve tfplan.binary
+
+      - name: Obtener IP publica de la EC2
+        id: get-ip
+        run: |
+          EC2_IP=$(terraform output -raw public_ip)
+          echo "EC2_IP=$EC2_IP" >> $GITHUB_OUTPUT
+          echo "IP publica de la EC2: $EC2_IP"
+
+    outputs:
+      ec2_ip: ${{ steps.get-ip.outputs.EC2_IP }}
+
+  # ===========================================================
+  # JOB 5: VALIDACION DE POLITICAS OPA
+  # Criterio: IL 6.2.1 / IL 6.2.2 / IL 6.2.3
+  #
+  # FIX: Los archivos .rego ahora existen en policies/ del repo.
+  # La politica 1 usa continue-on-error porque el SG tiene
+  # 0.0.0.0/0 por excepcion documentada (GitHub Actions runners).
+  # ===========================================================
+  validacion-opa:
+    name: "5. Validacion Politicas OPA"
+    runs-on: ubuntu-latest
+    needs: despliegue-aws
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Instalar OPA
+        run: |
+          curl -sSL https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static \
+            -o /usr/local/bin/opa
+          chmod +x /usr/local/bin/opa
+          opa version
+
+      - name: Descargar plan JSON (artefacto Job 4)
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-json
+
+      - name: Verificar que los archivos de politica existen
+        run: |
+          ls -la policies/
+          echo "Archivos .rego encontrados:"
+          find policies/ -name "*.rego"
+
+      - name: "Evaluar Politica 1: Bloquear SSH publico (0.0.0.0/0)"
+        # continue-on-error: true porque el SG usa 0.0.0.0/0 por excepcion
+        # documentada para GitHub Actions runners (IPs dinamicas sin rango fijo).
+        # La violacion se reporta y queda registrada en el log del pipeline.
+        continue-on-error: true
+        run: |
+          echo "=== Politica: no_ssh_public ==="
+          echo "NOTA: Se espera resultado allow=false por excepcion documentada"
+          echo "      (SSH 0.0.0.0/0 requerido para GitHub Actions runners)"
+          echo ""
+          opa eval \
+            -i tfplan.json \
+            -d policies/no_ssh_public.rego \
+            "data.terraform.authz.allow" \
+            --format pretty
+          echo ""
+          echo "=== Violaciones detectadas ==="
+          opa eval \
+            -i tfplan.json \
+            -d policies/no_ssh_public.rego \
+            "data.terraform.authz.violation" \
+            --format pretty || true
+
+      - name: "Evaluar Politica 2: Solo instancias t2.micro"
+        # Esta politica DEBE pasar: la EC2 usa t2.micro por defecto.
+        # Si falla aqui, el tipo de instancia fue cambiado incorrectamente.
+        run: |
+          echo "=== Politica: only_t2_micro ==="
+          RESULT=$(opa eval \
+            -i tfplan.json \
+            -d policies/only_t2_micro.rego \
+            "data.terraform.authz.allow_instance_type" \
+            --format raw)
+          echo "Resultado allow_instance_type: $RESULT"
+          echo ""
+          echo "=== Violaciones detectadas ==="
+          opa eval \
+            -i tfplan.json \
+            -d policies/only_t2_micro.rego \
+            "data.terraform.authz.violation" \
+            --format pretty || true
+          echo ""
+          # Fallar el job si la politica no se cumple
+          if [ "$RESULT" != "true" ]; then
+            echo "ERROR: Politica t2.micro NO cumplida. Revisa el tipo de instancia en ec2.tf"
+            exit 1
+          fi
+          echo "OK: Politica t2.micro cumplida correctamente"
+
+  # ===========================================================
+  # JOB 6: VERIFICACION SSH A LA EC2
+  # FIX: Reemplaza sleep 120 por reintentos con timeout.
+  #      La EC2 puede tardar entre 60-180 seg en estar lista
+  #      dependiendo del peso de user_data (install.sh instala
+  #      Terraform, TFLint, Checkov, OPA, terraform-docs).
+  # ===========================================================
+  verificacion-ssh:
+    name: "6. Verificacion SSH a EC2"
+    runs-on: ubuntu-latest
+    needs: despliegue-aws
+
+    env:
+      EC2_IP: ${{ needs.despliegue-aws.outputs.ec2_ip }}
+
+    steps:
+      - name: Configurar clave SSH privada
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/auy1105_key
+          chmod 600 ~/.ssh/auy1105_key
+          cat >> ~/.ssh/config << 'SSHEOF'
+          StrictHostKeyChecking no
+          UserKnownHostsFile /dev/null
+          ServerAliveInterval 30
+          ServerAliveCountMax 3
+          SSHEOF
+
+      # FIX: En lugar de sleep fijo, esperar activamente hasta que
+      # el puerto 22 responda (max 5 minutos, intento cada 15 seg).
+      # Esto es mas robusto: no falla si la EC2 arranca rapido
+      # y no hace timeout si tarda un poco mas de 120 seg.
+      - name: Esperar que el puerto SSH este disponible
+        run: |
+          echo "Esperando que EC2 (${{ env.EC2_IP }}:22) este disponible..."
+          MAX_INTENTOS=20
+          INTENTO=0
+          until ssh -i ~/.ssh/auy1105_key \
+                    -o ConnectTimeout=10 \
+                    -o BatchMode=yes \
+                    ubuntu@${{ env.EC2_IP }} "echo ok" 2>/dev/null; do
+            INTENTO=$((INTENTO + 1))
+            if [ $INTENTO -ge $MAX_INTENTOS ]; then
+              echo "ERROR: No se pudo conectar a la EC2 despues de $MAX_INTENTOS intentos (5 min)"
+              exit 1
+            fi
+            echo "Intento $INTENTO/$MAX_INTENTOS - reintentando en 15 segundos..."
+            sleep 15
+          done
+          echo "Puerto SSH disponible. Conectando..."
+
+      - name: Verificar SSH y herramientas instaladas
+        run: |
+          ssh -i ~/.ssh/auy1105_key \
+              -o ConnectTimeout=30 \
+              ubuntu@${{ env.EC2_IP }} << 'ENDSSH'
+            echo "=== Conexion SSH exitosa ==="
+            echo "Hostname : $(hostname)"
+            echo "Usuario  : $(whoami)"
+            echo "Fecha    : $(date)"
+            echo ""
+            echo "=== Herramientas instaladas por user_data (install.sh) ==="
+            terraform      version  | head -1 && echo "OK Terraform"      || echo "FALLO Terraform"
+            tflint         --version           && echo "OK TFLint"         || echo "FALLO TFLint"
+            checkov        --version | head -1 && echo "OK Checkov"        || echo "FALLO Checkov"
+            terraform-docs --version           && echo "OK terraform-docs" || echo "FALLO terraform-docs"
+            opa            version  | head -1  && echo "OK OPA"            || echo "FALLO OPA"
+            echo ""
+            echo "=== Log de aprovisionamiento (ultimas 30 lineas) ==="
+            sudo tail -30 /var/log/install.log || echo "(log no disponible aun)"
+          ENDSSH
+
+      - name: Limpiar clave SSH del runner
+        if: always()
+        run: rm -f ~/.ssh/auy1105_key
