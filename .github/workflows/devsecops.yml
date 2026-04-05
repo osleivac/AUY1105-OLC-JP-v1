@@ -6,7 +6,7 @@ name: DevSecOps Pipeline – AUY1105
 on:
   pull_request:
     branches:
-      - main
+      - dev-v1
 
 # Permisos mínimos para el runner
 permissions:
